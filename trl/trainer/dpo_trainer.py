@@ -29,6 +29,12 @@ import torch.nn.functional as F
 from accelerate import PartialState, logging
 from accelerate.utils import tqdm
 from datasets import Dataset, IterableDataset
+import inspect
+
+# print(inspect.getsourcefile(Dataset))  # 纯 Python 返回 .py；C 扩展多为 None
+# print(inspect.getfile(Dataset))        # 扩展函数会给到 .so/.pyd
+# import pdb; pdb.set_trace()
+
 from torch import autocast
 from torch.utils.data import DataLoader
 from transformers import (
@@ -52,6 +58,8 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPIN
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_liger_kernel_available, is_peft_available
+
+from qwen_vl_utils import process_vision_info
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..models import create_reference_model, prepare_deepspeed
@@ -154,14 +162,19 @@ class DataCollatorForPreference(DataCollatorMixin):
         chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
         rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
         rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
+        
         if "pixel_values" in examples[0]:
-            pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
+            pixel_values = [torch.tensor(example["pixel_values"]).squeeze(0) for example in examples]
+        if "image_grid_thw" in examples[0]:
+            image_grid_thw = [torch.tensor(example["image_grid_thw"][0]) for example in examples]
+        # print("开始")
+        # print(torch.tensor(examples[0]["pixel_values"]).size())
+        # print(torch.tensor(examples[0]["image_grid_thw"]))
         if "pixel_attention_mask" in examples[0]:
             pixel_attention_mask = [torch.tensor(example["pixel_attention_mask"]) for example in examples]
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
             ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
-
         # Pad
         output = {}
         output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
@@ -171,7 +184,7 @@ class DataCollatorForPreference(DataCollatorMixin):
         output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
         output["rejected_attention_mask"] = pad(rejected_attention_mask, padding_value=0)
         if "pixel_values" in examples[0]:
-            output["pixel_values"] = pad(pixel_values, padding_value=0.0)
+            output["pixel_values"] = torch.cat(pixel_values,dim=0)
         if "pixel_attention_mask" in examples[0]:
             output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
         if "image_sizes" in examples[0]:
@@ -179,6 +192,12 @@ class DataCollatorForPreference(DataCollatorMixin):
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
+        if "image_grid_thw" in examples[0]:
+            
+            output['image_grid_thw'] = torch.stack(image_grid_thw, dim=0)
+            # print(output['image_grid_thw'].size())
+        
+            
 
         return output
 
@@ -381,7 +400,9 @@ class DPOTrainer(Trainer):
         self.generate_during_eval = args.generate_during_eval
         self.label_pad_token_id = args.label_pad_token_id
         self.max_prompt_length = args.max_prompt_length
+        print(self.max_prompt_length)
         self.max_completion_length = args.max_completion_length
+        
         self.max_length = args.max_length
         self.truncation_mode = args.truncation_mode
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
@@ -640,9 +661,10 @@ class DPOTrainer(Trainer):
             # Tokenize the dataset
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
-
+            # print(self.is_vision_model)
             dataset = dataset.map(
                 self.tokenize_row if not self.is_vision_model else self.process_row,
+                # load_from_cache_file=False,   # 不读取已有缓存
                 remove_columns=["chosen", "rejected"],
                 fn_kwargs={
                     "processing_class": processing_class,
@@ -736,11 +758,23 @@ class DPOTrainer(Trainer):
         """
         Same as `tokenize_row` but for vision models. Please refer to `tokenize_row` for more information.
         """
+        # print(features)
+        
         processor, tokenizer = processing_class, processing_class.tokenizer  # the processing class is a processor
+        if "qwen2_5_vl" in str(processor.__class__):
+            content = [{"type": "image", "image": path } for path in features["images"]]
+            messages = [
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
+                ]
+            features["images"], _ = process_vision_info(messages)
+            
         processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
-
         prompt_input_ids = processed_features["input_ids"][0]
-        pixel_values = processed_features["pixel_values"][0]
+        pixel_values = processed_features["pixel_values"]
+        # print(" processed_features[pixel_values]",  processed_features["input_ids"])
         chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
         rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
 
@@ -771,6 +805,13 @@ class DPOTrainer(Trainer):
             output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
         if "image_sizes" in processed_features:
             output["image_sizes"] = processed_features["image_sizes"][0]
+        if "image_grid_thw" in processed_features:
+            output["image_grid_thw"] = processed_features["image_grid_thw"]
+            
+        # print(pixel_values)
+        # print(pixel_values.size())
+        # print(output["image_grid_thw"])
+       
 
         return output
 
@@ -960,11 +1001,13 @@ class DPOTrainer(Trainer):
 
         # For the prompt, the input_ids are the same for both the chosen and rejected responses
         output["prompt_input_ids"] = torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0)
+        output["image_grid_thw"] = batch["image_grid_thw"].repeat(2, 1)
         output["prompt_attention_mask"] = torch.cat(
             [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0
         )
         if "pixel_values" in batch:
-            output["pixel_values"] = torch.cat([batch["pixel_values"], batch["pixel_values"]], dim=0)
+            
+            output["pixel_values"] = torch.cat([batch["pixel_values"], batch["pixel_values"]], dim=-1)
 
         if "pixel_attention_mask" in batch:
             output["pixel_attention_mask"] = torch.cat(
@@ -1477,6 +1520,8 @@ class DPOTrainer(Trainer):
             model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
         if "image_sizes" in concatenated_batch:
             model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
+        if "image_grid_thw" in concatenated_batch:
+            model_kwargs["image_grid_thw"] = concatenated_batch["image_grid_thw"]
 
         prompt_input_ids = concatenated_batch["prompt_input_ids"]
         prompt_attention_mask = concatenated_batch["prompt_attention_mask"]

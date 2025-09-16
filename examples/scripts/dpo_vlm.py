@@ -1,70 +1,16 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# /// script
-# dependencies = [
-#     "trl @ git+https://github.com/huggingface/trl.git",
-#     "peft",
-#     "Pillow>=9.4.0",
-#     "torchvision",
-#     "trackio",
-#     "kernels",
-# ]
-# ///
-
-"""
-Without dataset streaming:
-
-```
-accelerate launch examples/scripts/dpo_vlm.py \
-    --dataset_name HuggingFaceH4/rlaif-v_formatted \
-    --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 32 \
-    --dataset_num_proc 32 \
-    --output_dir dpo_idefics_rlaif-v \
-    --dtype bfloat16 \
-    --gradient_checkpointing \
-    --use_peft \
-    --lora_target_modules all-linear
-```
-
-With dataset streaming:
-
-```
-accelerate launch examples/scripts/dpo_vlm.py \
-    --dataset_name HuggingFaceH4/rlaif-v_formatted \
-    --dataset_streaming \
-    --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-    --per_device_train_batch_size 2 \
-    --max_steps 100 \
-    --gradient_accumulation_steps 32 \
-    --dataset_num_proc 32 \
-    --output_dir dpo_idefics_rlaif-v \
-    --dtype bfloat16 \
-    --gradient_checkpointing \
-    --use_peft \
-    --lora_target_modules all-linear
-```
-"""
-
-import os
+from __future__ import annotations
+import os, io
+from pathlib import Path
 
 import torch
-from datasets import load_dataset
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from datasets import load_dataset, Image, Sequence
+from PIL import Image as PILImage
 
+from transformers import (
+    AutoProcessor,
+    Qwen2_5_VLForConditionalGeneration,
+    # 如果用 Trainer 的 TrainingArguments，也可从 transformers 导入
+)
 from trl import (
     DPOConfig,
     DPOTrainer,
@@ -76,87 +22,155 @@ from trl import (
     get_quantization_config,
 )
 
+# ---------- 建议：固定 NCCL 环境 ----------
+os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+os.environ.setdefault("MASTER_PORT", "29500")
+os.environ.setdefault("NCCL_DEBUG", "WARN")
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+# os.environ.setdefault("NCCL_P2P_DISABLE", "1")  # 如仍不稳，可再打开（降性能但更稳）
 
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+# ---------- 必做：绑定本进程 GPU ----------
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+torch.cuda.set_device(local_rank)
+
+def _ensure_pil(img_item):
+    """把 datasets 的 Image(decode=True/False) 项/字节流转成 PIL"""
+    if isinstance(img_item, dict):
+        b = img_item.get("bytes")
+        p = img_item.get("path")
+        if b is not None:
+            return PILImage.open(io.BytesIO(b)).convert("RGB")
+        if p:
+            return PILImage.open(p).convert("RGB")
+    if isinstance(img_item, PILImage.Image):
+        return img_item
+    raise ValueError(f"bad image item: {type(img_item)} | {img_item}")
 
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, DPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
 
-    ################
-    # Model & Tokenizer
-    ################
-    dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    # --------------- Model & Tokenizer ---------------
     quantization_config = get_quantization_config(model_args)
-
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
-        dtype=dtype,
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
-    )
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_args.model_name_or_path,
         trust_remote_code=model_args.trust_remote_code,
+    )
+
+    # 主模型（与参考模型同架构）
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+    )
+
+    # 与梯度检查点搭配：禁用缓存
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+    # 只开一处梯度检查点，且使用 non-reentrant
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    # 参考模型与主模型同架构，并冻结参数
+    ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        **({} if quantization_config is None else {}),
         **model_kwargs,
     )
-    peft_config = get_peft_config(model_args)
-    if peft_config is None:
-        ref_model = AutoModelForImageTextToText.from_pretrained(
-            model_args.model_name_or_path,
-            trust_remote_code=model_args.trust_remote_code,
-            **model_kwargs,
-        )
-    else:
-        ref_model = None
+    ref_model.requires_grad_(False)
+
     processor = AutoProcessor.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, do_image_splitting=False
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code,
+        do_image_splitting=False,
     )
     tokenizer = processor.tokenizer
-
-    # Set up the chat template
-    if model.config.model_type == "idefics2":
-        pass  # the processor already has a valid chat template
-    elif model.config.model_type == "paligemma":
-        processor.chat_template = """{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}<|im_start|>{% if message['role'] == 'user' %}USER: {% else %}ASSISTANT: {% endif %}{% for item in message['content'] if item['type'] == 'text' %}{{ item['text'] }}<|im_end|>{% endfor %}{% if message['role'] == 'user' %} {% else %}{{eos_token}}{% endif %}{% endfor %}{% if add_generation_prompt %}ASSISTANT: {% endif %}"""
-    elif model.config.model_type == "llava":
-        processor.chat_template = """{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{% if message['role'] == 'user' %}USER: {% else %}ASSISTANT: {% endif %}{% for item in message['content'] %}{% if item['type'] == 'text' %}{{ item['text'] }}{% elif item['type'] == 'image' %}<image>{% endif %}{% endfor %}{% if message['role'] == 'user' %} {% else %}{{eos_token}}{% endif %}{% endfor %}{% if add_generation_prompt %}ASSISTANT: {% endif %}"""
-
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     if script_args.ignore_bias_buffers:
         # torch distributed hack
         model._ddp_params_and_buffers_to_ignore = [
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    ################
-    # Dataset
-    ################
-    dataset = load_dataset(
-        script_args.dataset_name,
-        name=script_args.dataset_config,
-        streaming=script_args.dataset_streaming,
+    # --------------- Dataset ---------------
+    data_files = {
+        "train": "/home/ma-user/work/wbd/01_projects/clas/HKEmodel/Qwen25VL/test.parquet",
+    }
+    dsdict = load_dataset("parquet", data_files=data_files)
+    dataset = dsdict["train"]
+
+    # 若是“列表图像”列
+    if "images" in dataset.column_names:
+        dataset = dataset.cast_column("images", Sequence(Image(decode=True)))
+    elif "image" in dataset.column_names:
+        dataset = dataset.cast_column("image", Image(decode=True))
+
+    # 预清洗坏样本
+    def safe_check(ex):
+        try:
+            if "images" in ex and ex["images"]:
+                _ = _ensure_pil(ex["images"][0])
+            if "image" in ex:
+                _ = _ensure_pil(ex["image"])
+            # 按你的 schema 调整：DPO 需要 prompt/chosen/rejected
+            assert "prompt" in ex and "chosen" in ex and "rejected" in ex
+            return True
+        except Exception:
+            return False
+
+    dataset = dataset.filter(safe_check, desc="filter_bad_examples")
+
+    # --------------- Training Args 关键开关 ---------------
+    # 更稳的 DDP 设置：关闭“查找未用参数”，并开启非重入 checkpoint
+    setattr(training_args, "ddp_find_unused_parameters", False)
+    setattr(training_args, "gradient_checkpointing", True)
+    # 新版 transformers 支持设置 kwargs
+    setattr(
+        training_args,
+        "gradient_checkpointing_kwargs",
+        {"use_reentrant": False},
+    )
+    # 如果你的前向图稳定（每步结构一致），可考虑静态图（见下 Trainer 初始化后注释）
+
+    # 根据环境保守一些
+    if not hasattr(training_args, "dataloader_num_workers"):
+        training_args.dataloader_num_workers = 0
+    else:
+        training_args.dataloader_num_workers = 0
+    setattr(training_args, "torch_compile", False)
+
+    # --------------- Trainer ---------------
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=dataset,    # 必须是 Dataset
+        eval_dataset=None,
+        processing_class=processor,
+        peft_config=get_peft_config(model_args),
     )
 
-    ################
-    # Training
-    ################
-    trainer = DPOTrainer(
-        model,
-        ref_model,
-        args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=processor,
-        peft_config=peft_config,
-    )
+    # （可选）静态图：仅当前向图确定不变时使用
+    try:
+        ddp_model = trainer.accelerator.unwrap_model(trainer.model)
+        if hasattr(ddp_model, "_set_static_graph"):
+            pass
+            # ddp_model._set_static_graph()  # 前向图稳定时可开启
+    except Exception:
+        pass
 
     trainer.train()
 
-    # Save and push to hub
+    # Save and (optionally) push
     trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
+    if getattr(training_args, "push_to_hub", False):
         trainer.push_to_hub(dataset_name=script_args.dataset_name)
