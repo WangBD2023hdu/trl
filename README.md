@@ -1,4 +1,4 @@
-# TRL - Transformer Reinforcement Learning
+# This is not the official TRL implementation, it only adds DPO support for Qwen2.5-VL.
 
 <div style="text-align: center">
     <img src="https://huggingface.co/datasets/trl-lib/documentation-images/resolve/main/trl_banner_dark.png" alt="TRL Banner">
