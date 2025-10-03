@@ -33,7 +33,9 @@ accelerate launch examples/scripts/dpo_qwen.py \
     --gradient_accumulation_steps 32 \
     --dataset_num_proc 32 \
     --output_dir saving_dir \
-    --gradient_checkpointing 1
+    --gradient_checkpointing 1 \
+    --max_prompt_length 2048 \
+    --max_length 4096
 
 ```
 
@@ -54,6 +56,8 @@ accelerate launch examples/scripts/dpo_vlm.py \
     --use_peft \
     --lora_target_modules all-linear
 ```
+
+accelerate launch examples/scripts/dpo_qwen.py     --model_name_or_path /home/ma-user/work/pretrain_models/Qwen2.5-VL/Qwen2.5-VL-7B-Instruct     --per_device_train_batch_size 1     --gradient_accumulation_steps 32     --dataset_num_proc 64     --output_dir saving_dir     --gradient_checkpointing 1     --max_prompt_length 4096     --max_length 8192 --deepspeed examples/accelerate_configs/ds_config_zero3.json
 """
 
 import os
@@ -141,7 +145,10 @@ if __name__ == "__main__":
     dsdict = load_dataset("parquet", data_files=data_files)
     dataset = dsdict["train"]
 
-    ref_model = None
+    ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+    )
     training_args.remove_unused_columns=False
     trainer = DPOTrainer(
         model,
